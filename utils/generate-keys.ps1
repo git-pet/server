@@ -6,12 +6,14 @@ $ErrorActionPreference = "Stop"
 # -----------------------------
 function Get-RandomBytes([int]$length) {
     $bytes = New-Object byte[] $length
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $rng.GetBytes($bytes)
+    $rng.Dispose()
     return $bytes
 }
 
 function Gen-Hex([int]$length) {
-    ($b = Get-RandomBytes $length)
+    $b = Get-RandomBytes $length
     ($b | ForEach-Object { $_.ToString("x2") }) -join ""
 }
 
@@ -36,9 +38,9 @@ function Gen-Token($payloadJson, $headerJson, $secret) {
 
     $signed = "$headerB64.$payloadB64"
 
-    $hmac = New-Object System.Security.Cryptography.HMACSHA256(
-        [System.Text.Encoding]::UTF8.GetBytes($secret)
-    )
+    $keyBytes = [System.Text.Encoding]::UTF8.GetBytes($secret)
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256
+    $hmac.Key = $keyBytes
 
     $sigBytes = $hmac.ComputeHash(
         [System.Text.Encoding]::UTF8.GetBytes($signed)
@@ -104,6 +106,17 @@ Write-Host ""
 # -----------------------------
 # .env update
 # -----------------------------
+function Set-Or-AddEnvValue($content, $key, $value) {
+    $pattern = "(?m)^" + [regex]::Escape($key) + "=.*"
+
+    if ($content -match $pattern) {
+        return ($content -replace $pattern, "$key=$value")
+    }
+    else {
+        return ($content.TrimEnd() + "`r`n$key=$value`r`n")
+    }
+}
+
 $envPath = ".env"
 if (-not (Test-Path $envPath)) {
     Write-Host "No .env found. Skipping."
@@ -118,22 +131,21 @@ if ($reply -notmatch "^[Yy]") {
 
 $content = Get-Content $envPath -Raw
 
-$content = $content `
--replace "^JWT_SECRET=.*","JWT_SECRET=$jwt_secret" `
--replace "^ANON_KEY=.*","ANON_KEY=$anon_key" `
--replace "^SERVICE_ROLE_KEY=.*","SERVICE_ROLE_KEY=$service_role_key" `
--replace "^SECRET_KEY_BASE=.*","SECRET_KEY_BASE=$secret_key_base" `
--replace "^VAULT_ENC_KEY=.*","VAULT_ENC_KEY=$vault_enc_key" `
--replace "^PG_META_CRYPTO_KEY=.*","PG_META_CRYPTO_KEY=$pg_meta_crypto_key" `
--replace "^LOGFLARE_PUBLIC_ACCESS_TOKEN=.*","LOGFLARE_PUBLIC_ACCESS_TOKEN=$logflare_public_access_token" `
--replace "^LOGFLARE_PRIVATE_ACCESS_TOKEN=.*","LOGFLARE_PRIVATE_ACCESS_TOKEN=$logflare_private_access_token" `
--replace "^S3_PROTOCOL_ACCESS_KEY_ID=.*","S3_PROTOCOL_ACCESS_KEY_ID=$s3_protocol_access_key_id" `
--replace "^S3_PROTOCOL_ACCESS_KEY_SECRET=.*","S3_PROTOCOL_ACCESS_KEY_SECRET=$s3_protocol_access_key_secret" `
--replace "^MINIO_ROOT_PASSWORD=.*","MINIO_ROOT_PASSWORD=$minio_root_password" `
--replace "^POSTGRES_PASSWORD=.*","POSTGRES_PASSWORD=$postgres_password" `
--replace "^DASHBOARD_PASSWORD=.*","DASHBOARD_PASSWORD=$dashboard_password"
+$content = Set-Or-AddEnvValue $content "JWT_SECRET" $jwt_secret
+$content = Set-Or-AddEnvValue $content "ANON_KEY" $anon_key
+$content = Set-Or-AddEnvValue $content "SERVICE_ROLE_KEY" $service_role_key
+$content = Set-Or-AddEnvValue $content "SECRET_KEY_BASE" $secret_key_base
+$content = Set-Or-AddEnvValue $content "VAULT_ENC_KEY" $vault_enc_key
+$content = Set-Or-AddEnvValue $content "PG_META_CRYPTO_KEY" $pg_meta_crypto_key
+$content = Set-Or-AddEnvValue $content "LOGFLARE_PUBLIC_ACCESS_TOKEN" $logflare_public_access_token
+$content = Set-Or-AddEnvValue $content "LOGFLARE_PRIVATE_ACCESS_TOKEN" $logflare_private_access_token
+$content = Set-Or-AddEnvValue $content "S3_PROTOCOL_ACCESS_KEY_ID" $s3_protocol_access_key_id
+$content = Set-Or-AddEnvValue $content "S3_PROTOCOL_ACCESS_KEY_SECRET" $s3_protocol_access_key_secret
+$content = Set-Or-AddEnvValue $content "MINIO_ROOT_PASSWORD" $minio_root_password
+$content = Set-Or-AddEnvValue $content "POSTGRES_PASSWORD" $postgres_password
+$content = Set-Or-AddEnvValue $content "DASHBOARD_PASSWORD" $dashboard_password
 
 Copy-Item $envPath "$envPath.old" -Force
-Set-Content $envPath $content
+Set-Content $envPath $content -Encoding utf8
 
 Write-Host "Updated .env (backup: .env.old)"

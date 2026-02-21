@@ -6,7 +6,9 @@ $ErrorActionPreference = "Stop"
 # -----------------------------
 function Gen-Hex([int]$length) {
     $bytes = New-Object byte[] $length
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $rng.GetBytes($bytes)
+    $rng.Dispose()
     ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
 }
 
@@ -45,7 +47,7 @@ $new_passwd = Gen-Hex 16
 # -----------------------------
 # Find Postgres container
 # -----------------------------
-$dbImagePrefix = "supabase.postgres:"
+$dbImagePrefix = "supabase/postgres:"
 
 $composeLines = docker compose ps --format "{{.Image}}`t{{.Service}}`t{{.Status}}" 2>$null
 
@@ -131,7 +133,7 @@ BEGIN
     SET config = jsonb_set(
       config,
       '{url}',
-      '""postgresql://$db_admin_user:$new_passwd@$db_srv_name:$db_srv_port/postgres""',
+      '""postgresql://${db_admin_user}:${new_passwd}@${db_srv_name}:${db_srv_port}/postgres""',
       false
     )
     WHERE type = 'postgres';
