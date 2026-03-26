@@ -422,7 +422,7 @@ services:
       # Apply migrations shell script
       - ./volumes/db/migrate.sh:/docker-entrypoint-initdb.d/migrate.sh:Z
       # Apply migrations
-      - ./volumes/db/migrations:/docker-entrypoint-initdb.d/migrations:Z
+      - ./volumes/db/app-migrations:/docker-entrypoint-initdb.d/app-migrations:Z
       # Use named volume to persist pgsodium decryption key between restarts
       - db-config:/etc/postgresql-custom
     healthcheck:
