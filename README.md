@@ -85,3 +85,4 @@ See the [security section](https://supabase.com/docs/guides/self-hosting/docker#
 ## License
 
 This repository is licensed under the Apache 2.0 License. See the main [Supabase repository](https://github.com/supabase/supabase) for details.
+
