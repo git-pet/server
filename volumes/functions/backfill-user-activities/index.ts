@@ -223,7 +223,9 @@ async function fetchGitHubEvents(
     url && page < MAX_GITHUB_PAGES && activities.length < limit;
     page += 1
   ) {
-    const { data, nextUrl } = await githubFetchJson<GitHubEvent[]>(
+    const { data, nextUrl: fetchedNextUrl } = await githubFetchJson<
+      GitHubEvent[]
+    >(
       url,
       accessToken,
     );
@@ -243,7 +245,7 @@ async function fetchGitHubEvents(
 
     // GitHub Events are newest first, so older pages cannot enter the window.
     if (data.some((event) => new Date(event.created_at) < cutoff)) break;
-    url = nextUrl;
+    url = fetchedNextUrl;
   }
 
   return { fetched, normalized, activities };
@@ -264,7 +266,9 @@ async function fetchGitHubStars(
     url && page < MAX_GITHUB_PAGES && activities.length < remainingLimit;
     page += 1
   ) {
-    const { data, nextUrl } = await githubFetchJson<GitHubStar[]>(
+    const { data, nextUrl: fetchedNextUrl } = await githubFetchJson<
+      GitHubStar[]
+    >(
       url,
       accessToken,
       "application/vnd.github.star+json",
@@ -281,7 +285,7 @@ async function fetchGitHubStars(
     }
 
     if (data.some((star) => new Date(star.starred_at) < cutoff)) break;
-    url = nextUrl;
+    url = fetchedNextUrl;
   }
 
   return { fetched, normalized, activities };
