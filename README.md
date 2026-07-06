@@ -31,6 +31,39 @@ This Docker Compose configuration includes the following services:
 - **[Vector](https://github.com/vectordotdev/vector)** - High-performance observability data pipeline for logs
 - **[Supavisor](https://github.com/supabase/supavisor)** - Supabase's Postgres connection pooler
 
+## Git-Pet Edge Functions
+
+### Backfill user activities
+
+`backfill-user-activities` initializes a newly signed-up GitHub OAuth user with
+recent GitHub activity. The team-chosen trigger is a Flutter client call right
+after signup/login succeeds, because the client already has the user JWT and can
+retry gracefully if GitHub or the network is temporarily unavailable.
+
+Default client call:
+
+```bash
+curl -X POST "$SUPABASE_URL/functions/v1/backfill-user-activities" \
+  -H "Authorization: Bearer $USER_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"days":90,"limit":300}'
+```
+
+Internal service-role call for a specific user:
+
+```bash
+curl -X POST "$SUPABASE_URL/functions/v1/backfill-user-activities" \
+  -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"<user-uuid>","days":90,"limit":300}'
+```
+
+The function fetches recent push/commit, pull request, issue, and starred repo
+activity from GitHub REST API, stores normalized rows in `public.activities`,
+and relies on `add_pet_exp` plus the existing activity trigger to update the
+pet. `public.users.backfilled_at` and `activities.github_event_id` make repeated
+calls idempotent.
+
 ## Documentation
 
 - **[Documentation](https://supabase.com/docs/guides/self-hosting/docker)** - Setup and configuration guides

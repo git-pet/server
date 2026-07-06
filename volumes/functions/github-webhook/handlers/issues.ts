@@ -38,7 +38,21 @@ export async function handleIssues(ctx: HandlerContext): Promise<Response> {
     return ok(`issues: action '${action}' acknowledged, no xp`);
   }
 
-  const result = await awardXP(supabase, githubId, xp, reason);
+  const result = await awardXP(
+    supabase,
+    githubId,
+    xp,
+    reason,
+    "issue",
+    `github-webhook:${deliveryId}`,
+    {
+      repo: repoName,
+      action,
+      number: issue.number,
+      title: issue.title,
+      delivery_id: deliveryId,
+    },
+  );
 
   return ok("issues handled", {
     repo: repoName,
