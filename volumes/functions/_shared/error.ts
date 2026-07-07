@@ -2,7 +2,7 @@ import { corsHeaders } from "./response.ts";
 
 export class GitPetError extends Error {
   constructor(
-    public message: string,
+    message: string,
     public status: number = 400,
   ) {
     super(message);

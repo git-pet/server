@@ -16,6 +16,7 @@ export interface GitHubPayload {
     id: number;
     full_name: string;
     default_branch?: string;
+    owner?: { id?: number; login?: string };
   };
   // event-specific fields
   commits?: GitHubCommit[];

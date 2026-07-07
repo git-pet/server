@@ -1,5 +1,20 @@
 import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 
+type ActivityEventType =
+  | "commit"
+  | "pull_request"
+  | "code_review"
+  | "issue"
+  | "star"
+  | "fork"
+  | "release";
+
+type Json = Record<string, unknown>;
+
+/**
+ * Resolve a GitHub numeric user id to our public.users UUID.
+ * Returning null is expected when the GitHub actor is not registered here.
+ */
 export async function resolveUserId(
   supabase: SupabaseClient,
   githubId: number,
@@ -16,45 +31,47 @@ export async function resolveUserId(
   return data?.id ?? null;
 }
 
-function mapToActivityEventType(eventType: string): string {
-  const map: Record<string, string> = {
-    push: "commit",
-    pull_request: "pull_request",
-    pr_opened: "pull_request",
-    pr_merged: "pull_request",
-    pr_closed: "pull_request",
-    issues: "issue",
-    issue_opened: "issue",
-    issue_closed: "issue",
-    star: "star",
-    star_created: "star",
-  };
-  const mapped = map[eventType];
-  if (!mapped) throw new Error(`Unknown eventType for activities: ${eventType}`);
-  return mapped;
-}
-
+/**
+ * Award XP through add_pet_exp and, when supplied, store the normalized
+ * activity fields used by webhook and backfill flows alike.
+ */
 export async function awardXP(
   supabase: SupabaseClient,
   githubId: number,
   xp: number,
-  eventType: string,
+  reason: string,
+  activityEventType: ActivityEventType = "commit",
+  githubEventId?: string,
+  metadata: Json = {},
 ): Promise<{ userId: string | null; xp: number; skipped: boolean }> {
   const userId = await resolveUserId(supabase, githubId);
   if (!userId) {
     console.log(
-      `[xp] skip — github_id=${githubId} not registered (event=${eventType})`,
+      `[xp] skip github_id=${githubId} not registered reason=${reason}`,
     );
     return { userId: null, xp: 0, skipped: true };
   }
 
-  const { error } = await supabase.from("activities").insert({
-    user_id: userId,
-    event_type: mapToActivityEventType(eventType),
-    xp_gained: xp,
+  const { data, error } = await supabase.rpc("add_pet_exp", {
+    p_user_id: userId,
+    p_exp: xp,
+    p_event_type: activityEventType,
+    p_github_event_id: githubEventId ?? null,
+    p_metadata: {
+      source: "github-webhook",
+      reason,
+      ...metadata,
+    },
   });
 
-  if (error) throw new Error(`activities insert failed: ${error.message}`);
-  console.log(`[xp] +${xp} xp → user=${userId} (event=${eventType})`);
-  return { userId, xp, skipped: false };
+  if (error) throw new Error(`RPC add_pet_exp failed: ${error.message}`);
+
+  const inserted = (data as { inserted?: boolean } | null)?.inserted !== false;
+  const appliedXp = inserted ? xp : 0;
+
+  console.log(
+    `[xp] +${appliedXp} xp user=${userId} reason=${reason} inserted=${inserted}`,
+  );
+
+  return { userId, xp: appliedXp, skipped: !inserted };
 }

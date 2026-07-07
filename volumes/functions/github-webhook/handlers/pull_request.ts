@@ -46,7 +46,22 @@ export async function handlePullRequest(
     return ok(`pull_request: action '${action}' acknowledged, no xp`);
   }
 
-  const result = await awardXP(supabase, githubId, xp, reason);
+  const result = await awardXP(
+    supabase,
+    githubId,
+    xp,
+    reason,
+    "pull_request",
+    `github-webhook:${deliveryId}`,
+    {
+      repo: repoName,
+      action,
+      number: pr.number,
+      title: pr.title,
+      merged: pr.merged,
+      delivery_id: deliveryId,
+    },
+  );
 
   return ok("pull_request handled", {
     repo: repoName,

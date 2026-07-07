@@ -32,7 +32,22 @@ export async function handlePush(ctx: HandlerContext): Promise<Response> {
     commits.length * XP_WEIGHTS.push.per_commit,
     XP_WEIGHTS.push.max,
   );
-  const result = await awardXP(supabase, githubId, xp, "push");
+
+  const result = await awardXP(
+    supabase,
+    githubId,
+    xp,
+    "push",
+    "commit",
+    `github-webhook:${deliveryId}`,
+    {
+      repo: repoName,
+      ref,
+      commits: commits.length,
+      delivery_id: deliveryId,
+    },
+  );
+
   return ok("push handled", {
     repo: repoName,
     ref,

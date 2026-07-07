@@ -29,11 +29,23 @@ export async function handleStar(ctx: HandlerContext): Promise<Response> {
   }
 
   // 리포 오너가 XP를 받음
-  const repoOwnerId: number = repo?.owner?.id;
+  const repoOwnerId = repo?.owner?.id;
   if (!repoOwnerId) return ok("star: no repo owner, skipped");
 
   const xp = XP_WEIGHTS.star.created;
-  const result = await awardXP(supabase, repoOwnerId, xp, "star_created");
+  const result = await awardXP(
+    supabase,
+    repoOwnerId,
+    xp,
+    "star_created",
+    "star",
+    `github-webhook:${deliveryId}`,
+    {
+      repo: repo?.full_name ?? null,
+      starred_by: starrer.login,
+      delivery_id: deliveryId,
+    },
+  );
 
   return ok("star handled", {
     repo: repo?.full_name,
