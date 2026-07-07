@@ -24,12 +24,10 @@ export async function resolveUserId(
     .select("id")
     .eq("github_id", githubId)
     .single();
-
   if (error) {
     if (error.code === "PGRST116") return null;
     throw new Error(`DB error resolving user: ${error.message}`);
   }
-
   return data?.id ?? null;
 }
 
@@ -47,7 +45,6 @@ export async function awardXP(
   metadata: Json = {},
 ): Promise<{ userId: string | null; xp: number; skipped: boolean }> {
   const userId = await resolveUserId(supabase, githubId);
-
   if (!userId) {
     console.log(
       `[xp] skip github_id=${githubId} not registered reason=${reason}`,
