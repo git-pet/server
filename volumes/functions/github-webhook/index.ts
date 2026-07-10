@@ -4,6 +4,7 @@ import { handlePush } from "./handlers/push.ts";
 import { handlePullRequest } from "./handlers/pull_request.ts";
 import { handleIssues } from "./handlers/issues.ts";
 import { handleStar } from "./handlers/star.ts";
+import { logWebhookEvent } from "./lib/log-event.ts";
 
 // ──────────────────────────────────────────────
 // 서명 검증 (HMAC-SHA256)
@@ -111,19 +112,50 @@ Deno.serve(async (req: Request) => {
   const ctx = { supabase, payload, deliveryId };
 
   // ── 9. 이벤트 라우팅
+  let response: Response;
   try {
     switch (eventType) {
       case "push":
-        return await handlePush(ctx);
+        response = await handlePush(ctx);
+        break;
       case "pull_request":
-        return await handlePullRequest(ctx);
+        response = await handlePullRequest(ctx);
+        break;
       case "issues":
-        return await handleIssues(ctx);
+        response = await handleIssues(ctx);
+        break;
       case "star":
-        return await handleStar(ctx);
+        response = await handleStar(ctx);
+        break;
+      default:
+        return ok(`event '${eventType}' acknowledged`);
     }
   } catch (e) {
     console.error(`[webhook] unhandled error (event=${eventType}):`, e);
     return err("Internal server error", 500);
   }
+
+  // ── 10. 수신 이벤트 로깅 (실패해도 응답에 영향 없음)
+  //   핸들러 응답 body에서 지급 결과(userId/xp)를 꺼내 기록한다.
+  //   body는 한 번만 읽히므로 clone해서 파싱.
+  let userId: string | null = null;
+  let xpAwarded = 0;
+  try {
+    const parsed = await response.clone().json();
+    userId = parsed.userId ?? null;
+    xpAwarded = typeof parsed.xp === "number" ? parsed.xp : 0;
+  } catch {
+    // 핸들러가 결과 필드 없는 응답을 준 경우 → 0/null로 기록
+  }
+
+  await logWebhookEvent(supabase, {
+    eventType,
+    action: payload.action ?? null,
+    userId,
+    xpAwarded,
+    deliveryId,
+    rawBody: body,
+  });
+
+  return response;
 });
