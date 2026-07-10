@@ -356,6 +356,15 @@ services:
       SYNC_ACTIVITIES_MAX_GITHUB_PAGES: ${SYNC_ACTIVITIES_MAX_GITHUB_PAGES:-3}
       # TODO: Allow configuring VERIFY_JWT per function. This PR might help: https://github.com/supabase/cli/pull/786
       VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
+      # XP 가중치 외부화 (미설정 시 코드 기본값으로 폴백 → lib/xp-weights.ts)
+      XP_PUSH_PER_COMMIT: "${XP_PUSH_PER_COMMIT:-10}"
+      XP_PUSH_MAX: "${XP_PUSH_MAX:-50}"
+      XP_PR_OPENED: "${XP_PR_OPENED:-15}"
+      XP_PR_MERGED: "${XP_PR_MERGED:-60}"
+      XP_PR_CLOSED: "${XP_PR_CLOSED:-10}"
+      XP_ISSUE_OPENED: "${XP_ISSUE_OPENED:-8}"
+      XP_ISSUE_CLOSED: "${XP_ISSUE_CLOSED:-25}"
+      XP_STAR: "${XP_STAR:-3}"
     command: ["start", "--main-service", "/home/deno/functions/main"]
 
   analytics:
