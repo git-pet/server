@@ -45,25 +45,8 @@ export interface GitHubIssue {
   state: string;
   user: { id: number; login: string };
 }
-// XP 가중치 (1차 튜닝 완료 — feature/xp-weight-tuning-v1)
-export const XP_WEIGHTS = {
-  push: {
-    per_commit: 10,
-    max: 50, // 최대 5커밋치
-  },
-  pull_request: {
-    opened: 0, // 20 → 0: open/close 반복 어뷰징 방지, merge로만 실질 기여 인정
-    merged: 50,
-    closed: 10, // 5 → 10: 리뷰 후 닫힘도 최소 활동 인정
-  },
-  issues: {
-    opened: 5, // 10 → 5: 이슈 생성 어뷰징 완화
-    closed: 25, // 20 → 25: 이슈 해결에 가중
-  },
-  star: {
-    created: 5,
-  },
-} as const;
+// XP 가중치는 env 기반 외부화 모듈에서 관리 (lib/xp-weights.ts)
+export { XP_WEIGHTS } from "./lib/xp-weights.ts";
 // 공통 응답 헬퍼
 export function ok(message: string, data?: Record<string, unknown>): Response {
   return new Response(
