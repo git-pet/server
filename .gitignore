@@ -4,4 +4,4 @@
 !.env.example
 
 volumes/db/data/
-volumes/storage/
+volumes/storage/volumes/snippets/
