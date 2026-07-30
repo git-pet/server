@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { corsHeaders } from "../_shared/response.ts";
-import { GitPetError, errorResponse } from "../_shared/error.ts";
+import { errorResponse, GitPetError } from "../_shared/error.ts";
 
 type Json = Record<string, unknown>;
 
@@ -215,20 +215,22 @@ async function fetchGitHubEvents(
   const activities: ActivityInput[] = [];
   let fetched = 0;
   let normalized = 0;
-  let url: string | null =
-    `https://api.github.com/users/${encodeURIComponent(username)}/events?per_page=100`;
+  let url: string | null = `https://api.github.com/users/${
+    encodeURIComponent(username)
+  }/events?per_page=100`;
 
   for (
     let page = 0;
     url && page < MAX_GITHUB_PAGES && activities.length < limit;
     page += 1
   ) {
-    const { data, nextUrl: fetchedNextUrl } = await githubFetchJson<
-      GitHubEvent[]
-    >(
-      url,
-      accessToken,
-    );
+    const pageResult: { data: GitHubEvent[]; nextUrl: string | null } =
+      await githubFetchJson<GitHubEvent[]>(
+        url,
+        accessToken,
+      );
+    const data = pageResult.data;
+    const fetchedNextUrl: string | null = pageResult.nextUrl;
     fetched += data.length;
 
     for (const event of data) {
@@ -266,13 +268,14 @@ async function fetchGitHubStars(
     url && page < MAX_GITHUB_PAGES && activities.length < remainingLimit;
     page += 1
   ) {
-    const { data, nextUrl: fetchedNextUrl } = await githubFetchJson<
-      GitHubStar[]
-    >(
-      url,
-      accessToken,
-      "application/vnd.github.star+json",
-    );
+    const pageResult: { data: GitHubStar[]; nextUrl: string | null } =
+      await githubFetchJson<GitHubStar[]>(
+        url,
+        accessToken,
+        "application/vnd.github.star+json",
+      );
+    const data = pageResult.data;
+    const fetchedNextUrl: string | null = pageResult.nextUrl;
     fetched += data.length;
 
     for (const star of data) {
