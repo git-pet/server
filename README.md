@@ -64,6 +64,24 @@ and relies on `add_pet_exp` plus the existing activity trigger to update the
 pet. `public.users.backfilled_at` and `activities.github_event_id` make repeated
 calls idempotent.
 
+### Sync activities
+
+`sync-activities` is the scheduled incremental sync for users who already
+signed up. Run it from Supabase cron or an external scheduler every 6-12 hours
+with the service role key or `SYNC_ACTIVITIES_SECRET`.
+
+```bash
+curl -X POST "$SUPABASE_URL/functions/v1/sync-activities" \
+  -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"lookback_hours":24,"max_users":50}'
+```
+
+The sync reads each user's `last_synced_at`, fetches only newer GitHub REST API
+activity with a small overlap window, and advances `last_synced_at` after the
+GitHub requests complete. `activities.github_event_id` prevents duplicate EXP
+when a webhook, backfill, or previous sync already stored the same activity.
+
 ## Documentation
 
 - **[Documentation](https://supabase.com/docs/guides/self-hosting/docker)** - Setup and configuration guides

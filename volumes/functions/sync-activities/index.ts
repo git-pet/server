@@ -2,68 +2,110 @@ import { createClient } from "@supabase/supabase-js";
 
 type Json = Record<string, unknown>;
 
-// sync-activities is a backfill/safety-net Edge Function.
-// - POST {} runs batch mode for every user with a saved GitHub token.
-// - POST {"user_id":"..."} runs one user only.
-// The function reads recent GitHub Events with the user's OAuth access token,
-// then calls add_pet_exp so the existing activities -> pet trigger path awards XP.
-
 type SyncAccount = {
   user_id: string;
   github_id: string;
   username: string;
   access_token: string;
+  last_synced_at: string | null;
 };
 
 type GitHubEvent = {
   id: string;
   type: string;
   created_at: string;
-  repo?: {
-    name?: string;
-  };
+  repo?: { id?: number; name?: string };
   payload?: Json;
 };
 
+type GitHubStar = {
+  starred_at: string;
+  repo: {
+    id: number;
+    full_name: string;
+    html_url?: string;
+    owner?: { id?: number; login?: string };
+  };
+};
+
+type ActivityEventType = "commit" | "pull_request" | "issue" | "star";
+
 type NormalizedActivity = {
-  eventType: "commit" | "pull_request" | "issue";
+  eventType: ActivityEventType;
   xp: number;
   dedupeKey: string;
+  createdAt: string;
   metadata: Json;
+};
+
+type FetchResult = {
+  fetched: number;
+  normalized: number;
+  activities: NormalizedActivity[];
 };
 
 type UserSyncResult = {
   user_id: string;
   username?: string;
+  last_synced_at: string | null;
+  synced_at: string | null;
   fetched_events: number;
   processed_events: number;
   awarded_events: number;
   deduped_events: number;
   ignored_events: number;
+  exp_applied: number;
   errors: string[];
+  rate_limited: boolean;
+  token_expired: boolean;
 };
+
+type RequestInput = {
+  user_id?: string;
+  lookback_hours?: number;
+  max_users?: number;
+};
+
+class GitHubApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public retryAfter?: string | null,
+    public rateLimitReset?: string | null,
+  ) {
+    super(message);
+  }
+}
 
 const SUPABASE_URL = mustGetEnv("SUPABASE_URL");
 const SERVICE_ROLE_KEY = mustGetEnv("SUPABASE_SERVICE_ROLE_KEY");
 const SYNC_SECRET = Deno.env.get("SYNC_ACTIVITIES_SECRET");
-const MAX_GITHUB_PAGES = positiveIntegerEnv("SYNC_ACTIVITIES_MAX_GITHUB_PAGES", 3);
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_GITHUB_PAGES = positiveIntegerEnv(
+  "SYNC_ACTIVITIES_MAX_GITHUB_PAGES",
+  3,
+);
+const DEFAULT_LOOKBACK_HOURS = positiveIntegerEnv(
+  "SYNC_ACTIVITIES_LOOKBACK_HOURS",
+  24,
+);
+const DEFAULT_MAX_USERS = positiveIntegerEnv("SYNC_ACTIVITIES_MAX_USERS", 50);
+const SYNC_OVERLAP_MINUTES = positiveIntegerEnv(
+  "SYNC_ACTIVITIES_OVERLAP_MINUTES",
+  5,
+);
+const ONE_HOUR_MS = 60 * 60 * 1000;
+const ONE_MINUTE_MS = 60 * 1000;
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
 function mustGetEnv(name: string): string {
   const value = Deno.env.get(name);
-
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-
+  if (!value) throw new Error(`Missing required environment variable: ${name}`);
   return value;
 }
 
 function positiveIntegerEnv(name: string, fallback: number): number {
   const value = Number(Deno.env.get(name) ?? fallback);
-
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
@@ -77,21 +119,12 @@ function jsonResponse(body: unknown, status = 200): Response {
 function getBearerToken(req: Request): string | null {
   const auth = req.headers.get("authorization");
   const [scheme, token] = auth?.split(" ") ?? [];
-
-  if (scheme !== "Bearer" || !token) {
-    return null;
-  }
-
-  return token;
+  return scheme?.toLowerCase() === "bearer" && token ? token : null;
 }
 
 function isAuthorized(req: Request): boolean {
-  // Cron can use the Supabase service role key as a Bearer token.
-  if (getBearerToken(req) === SERVICE_ROLE_KEY) {
-    return true;
-  }
+  if (getBearerToken(req) === SERVICE_ROLE_KEY) return true;
 
-  // External schedulers can use a narrower shared secret instead.
   return Boolean(
     SYNC_SECRET && req.headers.get("x-sync-activities-secret") === SYNC_SECRET,
   );
@@ -109,51 +142,65 @@ async function loadAccounts(userId?: string): Promise<SyncAccount[]> {
   return (data ?? []) as SyncAccount[];
 }
 
-async function fetchGitHubEvents(
+async function githubFetchJson<T>(
+  url: string,
   accessToken: string,
-  cutoff: Date,
-): Promise<GitHubEvent[]> {
-  const events: GitHubEvent[] = [];
-  let url: string | null = "https://api.github.com/user/events?per_page=100";
+  accept = "application/vnd.github+json",
+): Promise<{ data: T; nextUrl: string | null }> {
+  let response: Response;
 
-  for (let page = 0; url && page < MAX_GITHUB_PAGES; page += 1) {
-    const response = await fetch(url, {
+  try {
+    response = await fetch(url, {
       headers: {
-        accept: "application/vnd.github+json",
+        accept,
         authorization: `Bearer ${accessToken}`,
         "x-github-api-version": "2022-11-28",
         "user-agent": "git-pet-sync-activities",
       },
     });
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`GitHub ${response.status}: ${body}`);
-    }
-
-    const pageEvents = await response.json() as GitHubEvent[];
-    events.push(...pageEvents);
-
-    // GitHub returns newest events first. If this page already has an old
-    // event, later pages are older too and cannot matter for the 24h window.
-    if (pageEvents.some((event) => new Date(event.created_at) < cutoff)) {
-      break;
-    }
-
-    url = nextLink(response.headers.get("link"));
+  } catch (error) {
+    throw new GitHubApiError(`GitHub network error: ${String(error)}`, 0);
   }
 
-  return events.filter((event) => new Date(event.created_at) >= cutoff);
+  if (!response.ok) {
+    const body = await response.text();
+    const remaining = response.headers.get("x-ratelimit-remaining");
+    const reset = response.headers.get("x-ratelimit-reset");
+    const retryAfter = response.headers.get("retry-after");
+    const resetAt = reset ? new Date(Number(reset) * 1000).toISOString() : null;
+
+    if (response.status === 401) {
+      throw new GitHubApiError("GitHub token is expired or invalid", 401);
+    }
+
+    if (response.status === 403 && remaining === "0") {
+      throw new GitHubApiError(
+        "GitHub rate limit exceeded",
+        403,
+        retryAfter,
+        resetAt,
+      );
+    }
+
+    throw new GitHubApiError(
+      `GitHub ${response.status}: ${body.slice(0, 500)}`,
+      response.status,
+      retryAfter,
+      resetAt,
+    );
+  }
+
+  return {
+    data: await response.json() as T,
+    nextUrl: nextLink(response.headers.get("link")),
+  };
 }
 
 function nextLink(linkHeader: string | null): string | null {
-  if (!linkHeader) {
-    return null;
-  }
+  if (!linkHeader) return null;
 
   for (const part of linkHeader.split(",")) {
     const [rawUrl, rawRel] = part.trim().split(";");
-
     if (rawRel?.trim() === 'rel="next"') {
       return rawUrl.trim().slice(1, -1);
     }
@@ -162,23 +209,95 @@ function nextLink(linkHeader: string | null): string | null {
   return null;
 }
 
-function normalizeEvent(event: GitHubEvent): NormalizedActivity | null {
+async function fetchGitHubEvents(
+  account: SyncAccount,
+  cutoff: Date,
+): Promise<FetchResult> {
+  const activities: NormalizedActivity[] = [];
+  let fetched = 0;
+  let normalized = 0;
+  let url: string | null = `https://api.github.com/users/${
+    encodeURIComponent(account.username)
+  }/events?per_page=100`;
+
+  for (let page = 0; url && page < MAX_GITHUB_PAGES; page += 1) {
+    const pageResult: { data: GitHubEvent[]; nextUrl: string | null } =
+      await githubFetchJson<GitHubEvent[]>(url, account.access_token);
+    const data = pageResult.data;
+    const fetchedNextUrl: string | null = pageResult.nextUrl;
+    fetched += data.length;
+
+    for (const event of data) {
+      const createdAt = new Date(event.created_at);
+      if (createdAt < cutoff) continue;
+
+      const activity = normalizeGitHubEvent(event);
+      if (activity) {
+        normalized += 1;
+        activities.push(activity);
+      }
+    }
+
+    // Events are newest first. Once this page contains an old item, later pages
+    // cannot produce new incremental activity for this sync window.
+    if (data.some((event) => new Date(event.created_at) < cutoff)) break;
+    url = fetchedNextUrl;
+  }
+
+  return { fetched, normalized, activities };
+}
+
+async function fetchGitHubStars(
+  accessToken: string,
+  cutoff: Date,
+): Promise<FetchResult> {
+  const activities: NormalizedActivity[] = [];
+  let fetched = 0;
+  let normalized = 0;
+  let url: string | null = "https://api.github.com/user/starred?per_page=100";
+
+  for (let page = 0; url && page < MAX_GITHUB_PAGES; page += 1) {
+    const pageResult: { data: GitHubStar[]; nextUrl: string | null } =
+      await githubFetchJson<GitHubStar[]>(
+        url,
+        accessToken,
+        "application/vnd.github.star+json",
+      );
+    const data = pageResult.data;
+    const fetchedNextUrl: string | null = pageResult.nextUrl;
+    fetched += data.length;
+
+    for (const star of data) {
+      const starredAt = new Date(star.starred_at);
+      if (starredAt < cutoff) continue;
+
+      normalized += 1;
+      activities.push(normalizeStar(star));
+    }
+
+    if (data.some((star) => new Date(star.starred_at) < cutoff)) break;
+    url = fetchedNextUrl;
+  }
+
+  return { fetched, normalized, activities };
+}
+
+function normalizeGitHubEvent(event: GitHubEvent): NormalizedActivity | null {
   const payload = event.payload ?? {};
   const repo = event.repo?.name ?? null;
 
   if (event.type === "PushEvent") {
     const commits = Array.isArray(payload.commits) ? payload.commits : [];
-
-    if (commits.length === 0) {
-      return null;
-    }
+    if (commits.length === 0) return null;
 
     return {
       eventType: "commit",
       xp: Math.min(commits.length * 10, 50),
-      dedupeKey: dedupeKey(event),
+      dedupeKey: `github-rest:event:${event.id}`,
+      createdAt: event.created_at,
       metadata: {
         source: "sync-activities",
+        github_event_type: event.type,
         repo,
         commits: commits.length,
         github_event: event,
@@ -192,22 +311,19 @@ function normalizeEvent(event: GitHubEvent): NormalizedActivity | null {
     const merged = pr?.merged === true;
     let xp = 0;
 
-    if (action === "opened") {
-      xp = 20;
-    } else if (action === "closed" && merged) {
-      xp = 50;
-    } else if (action === "closed") {
-      xp = 5;
-    } else {
-      return null;
-    }
+    if (action === "opened") xp = 20;
+    else if (action === "closed" && merged) xp = 50;
+    else if (action === "closed") xp = 5;
+    else return null;
 
     return {
       eventType: "pull_request",
       xp,
-      dedupeKey: dedupeKey(event),
+      dedupeKey: `github-rest:event:${event.id}`,
+      createdAt: event.created_at,
       metadata: {
         source: "sync-activities",
+        github_event_type: event.type,
         repo,
         action,
         number: pr?.number ?? null,
@@ -223,20 +339,18 @@ function normalizeEvent(event: GitHubEvent): NormalizedActivity | null {
     const issue = asJsonObject(payload.issue);
     let xp = 0;
 
-    if (action === "opened") {
-      xp = 10;
-    } else if (action === "closed") {
-      xp = 20;
-    } else {
-      return null;
-    }
+    if (action === "opened") xp = 10;
+    else if (action === "closed") xp = 20;
+    else return null;
 
     return {
       eventType: "issue",
       xp,
-      dedupeKey: dedupeKey(event),
+      dedupeKey: `github-rest:event:${event.id}`,
+      createdAt: event.created_at,
       metadata: {
         source: "sync-activities",
+        github_event_type: event.type,
         repo,
         action,
         number: issue?.number ?? null,
@@ -250,22 +364,32 @@ function normalizeEvent(event: GitHubEvent): NormalizedActivity | null {
   return null;
 }
 
-function dedupeKey(event: GitHubEvent): string {
-  // Namespacing prevents accidental collisions with webhook delivery IDs.
-  return `github-rest:event:${event.id}`;
+function normalizeStar(star: GitHubStar): NormalizedActivity {
+  return {
+    eventType: "star",
+    xp: 5,
+    dedupeKey: `github-rest:star:${star.repo.id}:${star.starred_at}`,
+    createdAt: star.starred_at,
+    metadata: {
+      source: "sync-activities",
+      github_event_type: "StarredRepository",
+      repo: star.repo.full_name,
+      repo_id: star.repo.id,
+      url: star.repo.html_url ?? null,
+      owner: star.repo.owner?.login ?? null,
+      starred_at: star.starred_at,
+    },
+  };
 }
 
 function asJsonObject(value: unknown): Json | null {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    return value as Json;
-  }
-
-  return null;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Json
+    : null;
 }
 
 function getString(object: Json | null, key: string): string | null {
   const value = object?.[key];
-
   return typeof value === "string" ? value : null;
 }
 
@@ -278,59 +402,115 @@ async function awardActivity(
     p_exp: activity.xp,
     p_event_type: activity.eventType,
     p_github_event_id: activity.dedupeKey,
-    p_metadata: activity.metadata,
+    p_metadata: {
+      ...activity.metadata,
+      created_at: activity.createdAt,
+    },
+  });
+
+  if (error) throw new Error(`RPC add_pet_exp failed: ${error.message}`);
+  return (data as { inserted?: boolean } | null)?.inserted === true;
+}
+
+async function markSynced(userId: string, syncedAt: Date): Promise<string> {
+  const { data, error } = await supabase.rpc("mark_github_activities_synced", {
+    p_user_id: userId,
+    p_synced_at: syncedAt.toISOString(),
   });
 
   if (error) {
-    throw new Error(`RPC add_pet_exp failed: ${error.message}`);
+    throw new Error(
+      `RPC mark_github_activities_synced failed: ${error.message}`,
+    );
   }
 
-  return (data as Json | null)?.inserted === true;
+  return String(data);
+}
+
+function syncCutoff(account: SyncAccount, lookbackHours: number): Date {
+  if (!account.last_synced_at) {
+    return new Date(Date.now() - lookbackHours * ONE_HOUR_MS);
+  }
+
+  // Small overlap protects against clock drift and events near the boundary.
+  return new Date(
+    new Date(account.last_synced_at).getTime() -
+      SYNC_OVERLAP_MINUTES * ONE_MINUTE_MS,
+  );
 }
 
 async function syncAccount(
   account: SyncAccount,
-  cutoff: Date,
+  lookbackHours: number,
+  runStartedAt: Date,
 ): Promise<UserSyncResult> {
   const result: UserSyncResult = {
     user_id: account.user_id,
     username: account.username,
+    last_synced_at: account.last_synced_at,
+    synced_at: null,
     fetched_events: 0,
     processed_events: 0,
     awarded_events: 0,
     deduped_events: 0,
     ignored_events: 0,
+    exp_applied: 0,
     errors: [],
+    rate_limited: false,
+    token_expired: false,
   };
 
   try {
-    const events = await fetchGitHubEvents(account.access_token, cutoff);
-    result.fetched_events = events.length;
+    const cutoff = syncCutoff(account, lookbackHours);
+    const eventResult = await fetchGitHubEvents(account, cutoff);
+    const starResult = await fetchGitHubStars(account.access_token, cutoff);
+    const activities = [...eventResult.activities, ...starResult.activities]
+      .sort((a, b) =>
+        new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+      );
 
-    for (const event of events) {
-      const activity = normalizeEvent(event);
+    result.fetched_events = eventResult.fetched + starResult.fetched;
+    result.processed_events = activities.length;
+    result.ignored_events = Math.max(
+      result.fetched_events - eventResult.normalized - starResult.normalized,
+      0,
+    );
 
-      if (!activity) {
-        result.ignored_events += 1;
-        continue;
-      }
-
-      result.processed_events += 1;
-
+    for (const activity of activities) {
       try {
         const inserted = await awardActivity(account, activity);
 
         if (inserted) {
           result.awarded_events += 1;
+          result.exp_applied += activity.xp;
         } else {
           result.deduped_events += 1;
         }
       } catch (error) {
-        result.errors.push(`${event.type}:${event.id}: ${String(error)}`);
+        result.errors.push(`${activity.dedupeKey}: ${String(error)}`);
       }
     }
+
+    // Only advance the cursor after GitHub fetches and activity inserts
+    // completed. If an insert failed, keep last_synced_at unchanged so the
+    // next run can retry; github_event_id dedupe protects successful rows.
+    if (result.errors.length === 0) {
+      result.synced_at = await markSynced(account.user_id, runStartedAt);
+    }
   } catch (error) {
-    result.errors.push(String(error));
+    if (error instanceof GitHubApiError) {
+      result.rate_limited = error.status === 403 &&
+        error.message.includes("rate limit");
+      result.token_expired = error.status === 401;
+      result.errors.push(JSON.stringify({
+        message: error.message,
+        github_status: error.status,
+        retry_after: error.retryAfter ?? null,
+        rate_limit_reset: error.rateLimitReset ?? null,
+      }));
+    } else {
+      result.errors.push(String(error));
+    }
   }
 
   console.log(JSON.stringify({
@@ -342,9 +522,7 @@ async function syncAccount(
 }
 
 Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") {
-    return new Response("ok");
-  }
+  if (req.method === "OPTIONS") return new Response("ok");
 
   if (req.method !== "POST") {
     return jsonResponse({ error: "Method not allowed" }, 405);
@@ -354,40 +532,54 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "Unauthorized" }, 401);
   }
 
-  let input: { user_id?: string } = {};
+  let input: RequestInput = {};
 
   try {
     input = await req.json();
   } catch {
-    // Empty body is allowed and means batch mode.
+    // Empty body is allowed and means scheduled batch mode.
   }
 
   try {
-    const cutoff = new Date(Date.now() - ONE_DAY_MS);
-    const accounts = await loadAccounts(input.user_id);
+    const runStartedAt = new Date();
+    const lookbackHours = input.lookback_hours && input.lookback_hours > 0
+      ? Math.floor(input.lookback_hours)
+      : DEFAULT_LOOKBACK_HOURS;
+    const maxUsers = input.user_id
+      ? 1
+      : input.max_users && input.max_users > 0
+      ? Math.floor(input.max_users)
+      : DEFAULT_MAX_USERS;
+    const accounts = (await loadAccounts(input.user_id)).slice(0, maxUsers);
     const mode = input.user_id ? "single_user" : "batch";
 
     if (input.user_id && accounts.length === 0) {
       return jsonResponse({
         mode,
-        cutoff: cutoff.toISOString(),
+        run_started_at: runStartedAt.toISOString(),
+        lookback_hours: lookbackHours,
         results: [{
           user_id: input.user_id,
+          last_synced_at: null,
+          synced_at: null,
           fetched_events: 0,
           processed_events: 0,
           awarded_events: 0,
           deduped_events: 0,
           ignored_events: 0,
+          exp_applied: 0,
           errors: ["GitHub access token not found for user"],
+          rate_limited: false,
+          token_expired: false,
         }],
       });
     }
 
     const results: UserSyncResult[] = [];
 
-    // Sequential processing avoids rate-limit spikes during cron batch runs.
+    // Sequential processing avoids GitHub rate-limit spikes during cron runs.
     for (const account of accounts) {
-      results.push(await syncAccount(account, cutoff));
+      results.push(await syncAccount(account, lookbackHours, runStartedAt));
     }
 
     const totals = results.reduce(
@@ -398,7 +590,12 @@ Deno.serve(async (req: Request) => {
         awarded_events: acc.awarded_events + result.awarded_events,
         deduped_events: acc.deduped_events + result.deduped_events,
         ignored_events: acc.ignored_events + result.ignored_events,
+        exp_applied: acc.exp_applied + result.exp_applied,
         failed_users: acc.failed_users + (result.errors.length > 0 ? 1 : 0),
+        rate_limited_users: acc.rate_limited_users +
+          (result.rate_limited ? 1 : 0),
+        token_expired_users: acc.token_expired_users +
+          (result.token_expired ? 1 : 0),
       }),
       {
         users: 0,
@@ -407,20 +604,27 @@ Deno.serve(async (req: Request) => {
         awarded_events: 0,
         deduped_events: 0,
         ignored_events: 0,
+        exp_applied: 0,
         failed_users: 0,
+        rate_limited_users: 0,
+        token_expired_users: 0,
       },
     );
 
     console.log(JSON.stringify({
       message: "sync-activities run finished",
       mode,
-      cutoff: cutoff.toISOString(),
+      run_started_at: runStartedAt.toISOString(),
+      lookback_hours: lookbackHours,
+      max_users: maxUsers,
       totals,
     }));
 
     return jsonResponse({
       mode,
-      cutoff: cutoff.toISOString(),
+      run_started_at: runStartedAt.toISOString(),
+      lookback_hours: lookbackHours,
+      max_users: maxUsers,
       totals,
       results,
     });
