@@ -33,6 +33,24 @@ This Docker Compose configuration includes the following services:
 
 ## Git-Pet Edge Functions
 
+### User profile
+
+`user-profile` exposes the current user's editable profile and other users'
+public profile snapshots. All requests require a valid user JWT.
+
+```bash
+curl "$SUPABASE_URL/functions/v1/user-profile/me" \
+  -H "Authorization: Bearer $USER_JWT"
+
+curl "$SUPABASE_URL/functions/v1/user-profile/<user-uuid>" \
+  -H "Authorization: Bearer $USER_JWT"
+
+curl -X PUT "$SUPABASE_URL/functions/v1/user-profile/me" \
+  -H "Authorization: Bearer $USER_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"nickname":"Yulmu","avatar_url":"https://example.com/avatar.png"}'
+```
+
 ### Backfill user activities
 
 `backfill-user-activities` initializes a newly signed-up GitHub OAuth user with
