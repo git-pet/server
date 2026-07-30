@@ -51,6 +51,19 @@ curl -X PUT "$SUPABASE_URL/functions/v1/user-profile/me" \
   -d '{"nickname":"Yulmu","avatar_url":"https://example.com/avatar.png"}'
 ```
 
+### Pet check-in
+
+`pet-checkin` grants once-per-KST-day retention EXP when the app opens and lets
+the client show the active streak plus the next reward.
+
+```bash
+curl -X POST "$SUPABASE_URL/functions/v1/pet-checkin" \
+  -H "Authorization: Bearer $USER_JWT"
+
+curl "$SUPABASE_URL/functions/v1/pet-checkin/streak" \
+  -H "Authorization: Bearer $USER_JWT"
+```
+
 ### Backfill user activities
 
 `backfill-user-activities` initializes a newly signed-up GitHub OAuth user with
