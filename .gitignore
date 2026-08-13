@@ -1,7 +1,17 @@
 .env
 .env.*
-
 !.env.example
 
+# 런타임 데이터
 volumes/db/data/
-volumes/storage/volumes/snippets/
+volumes/storage/
+
+# Studio SQL Editor 스니펫 (운영 산출물, 저장소 추적 대상 아님)
+volumes/snippets/
+
+# edge-runtime 부팅 실패 유발
+volumes/functions/deno.lock
+
+# 로컬 백업 / 임시 파일
+*.bak-*
+test.txt
