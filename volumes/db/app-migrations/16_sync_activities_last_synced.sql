@@ -1,5 +1,5 @@
 -- ============================================================
--- 13_sync_activities_last_synced.sql
+-- 16_sync_activities_last_synced.sql
 -- Incremental scheduled sync support for GitHub activity polling.
 -- ============================================================
 
