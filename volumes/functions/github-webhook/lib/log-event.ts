@@ -1,46 +1,74 @@
-import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "@supabase/supabase-js";
+
+type ClaimResult = {
+  claimed?: boolean;
+  status?: string;
+  processed_at?: string | null;
+  user_id?: string | null;
+  xp_awarded?: number | null;
+};
 
 /**
- * webhook_events 테이블에 수신 이벤트를 기록한다.
+ * Reserve a GitHub webhook delivery before running handlers.
  *
- * - delivery_id unique 충돌(동일 delivery 재전송)은 정상 흐름으로 간주하고 조용히 스킵.
- * - 그 외 에러도 삼킨다: 로깅 실패가 웹훅 200 응답(→ GitHub 재전송 방지)을 막으면 안 됨.
+ * If GitHub redelivers the same X-GitHub-Delivery id, the DB unique index makes
+ * this return claimed=false so the router can acknowledge it without awarding
+ * XP again.
  */
-export async function logWebhookEvent(
+export async function claimWebhookDelivery(
   supabase: SupabaseClient,
   params: {
-    eventType: string;
-    action: string | null;
-    userId: string | null;
-    xpAwarded: number;
+    eventType: string | null;
     deliveryId: string;
     rawBody: string;
   },
+): Promise<ClaimResult> {
+  const rawPayloadHash = await sha256Hex(params.rawBody);
+  const { data, error } = await supabase.rpc("claim_github_webhook_delivery", {
+    p_delivery_id: params.deliveryId,
+    p_event_type: params.eventType ?? "unknown",
+    p_action: null,
+    p_raw_payload_hash: rawPayloadHash,
+  });
+
+  if (error) {
+    throw new Error(
+      `RPC claim_github_webhook_delivery failed: ${error.message}`,
+    );
+  }
+
+  return (data ?? {}) as ClaimResult;
+}
+
+/**
+ * Mark the reserved delivery with the final handler result.
+ * Logging failures are intentionally swallowed so GitHub does not retry a
+ * successfully processed webhook only because audit logging failed.
+ */
+export async function finishWebhookDelivery(
+  supabase: SupabaseClient,
+  params: {
+    deliveryId: string;
+    status: "processed" | "failed" | "ignored";
+    action?: string | null;
+    userId?: string | null;
+    xpAwarded?: number;
+    errorMessage?: string | null;
+  },
 ): Promise<void> {
-  try {
-    const rawPayloadHash = await sha256Hex(params.rawBody);
+  const { error } = await supabase.rpc("finish_github_webhook_delivery", {
+    p_delivery_id: params.deliveryId,
+    p_status: params.status,
+    p_user_id: params.userId ?? null,
+    p_xp_awarded: params.xpAwarded ?? 0,
+    p_action: params.action ?? null,
+    p_error_message: params.errorMessage ?? null,
+  });
 
-    const { error } = await supabase.from("webhook_events").insert({
-      event_type: params.eventType,
-      action: params.action,
-      user_id: params.userId,
-      xp_awarded: params.xpAwarded,
-      delivery_id: params.deliveryId,
-      raw_payload_hash: rawPayloadHash,
-    });
-
-    if (error) {
-      // 23505 = unique_violation → 중복 수신, 정상
-      if (error.code === "23505") {
-        console.log(
-          `[webhook-log] duplicate delivery=${params.deliveryId}, skip`,
-        );
-        return;
-      }
-      console.error(`[webhook-log] insert failed: ${error.message}`);
-    }
-  } catch (e) {
-    console.error("[webhook-log] unexpected error:", e);
+  if (error) {
+    console.error(
+      `[webhook-log] finish failed delivery=${params.deliveryId}: ${error.message}`,
+    );
   }
 }
 
