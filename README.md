@@ -109,6 +109,11 @@ and relies on `add_pet_exp` plus the existing activity trigger to update the
 pet. `public.users.backfilled_at` and `activities.github_event_id` make repeated
 calls idempotent.
 
+Large backfills follow GitHub `Link` pagination until the requested date or
+item limit is reached. Each fetched page is bulk inserted and the current cursor
+is stored in `public.github_backfill_runs`, so rate limits or network failures
+can be retried without re-awarding already saved EXP.
+
 ### Sync activities
 
 `sync-activities` is the scheduled incremental sync for users who already

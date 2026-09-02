@@ -26,6 +26,11 @@ type GitHubFetchResult = {
   activities: ActivityInput[];
 };
 
+type GitHubPageResult = GitHubFetchResult & {
+  nextUrl: string | null;
+  reachedCutoff: boolean;
+};
+
 type GitHubStar = {
   starred_at: string;
   repo: {
@@ -51,6 +56,39 @@ type RequestBody = {
   force?: boolean;
 };
 
+type BackfillPhase = "events" | "stars" | "completed";
+type BackfillStatus = "running" | "rate_limited" | "failed" | "completed";
+
+type BackfillRun = {
+  user_id: string;
+  status: BackfillStatus;
+  phase: BackfillPhase;
+  events_next_url: string | null;
+  stars_next_url: string | null;
+  fetched_events: number;
+  normalized_events: number;
+  saved_count: number;
+  duplicate_skipped_count: number;
+  exp_applied: number;
+  last_error: string | null;
+  retry_after: string | null;
+  rate_limit_reset: string | null;
+  started_at: string;
+  completed_at: string | null;
+  updated_at: string;
+};
+
+type BackfillSummary = {
+  fetched_events: number;
+  normalized_events: number;
+  saved_count: number;
+  duplicate_skipped_count: number;
+  exp_applied: number;
+  completed: boolean;
+  backfilled_at: string | null;
+  phase: BackfillPhase;
+};
+
 class GitHubApiError extends Error {
   constructor(
     message: string,
@@ -67,7 +105,15 @@ const SERVICE_ROLE_KEY = mustGetEnv("SUPABASE_SERVICE_ROLE_KEY");
 const ANON_KEY = mustGetEnv("SUPABASE_ANON_KEY");
 const DEFAULT_DAYS = positiveIntegerEnv("BACKFILL_GITHUB_DAYS", 90);
 const DEFAULT_LIMIT = positiveIntegerEnv("BACKFILL_GITHUB_LIMIT", 300);
-const MAX_GITHUB_PAGES = positiveIntegerEnv("BACKFILL_GITHUB_MAX_PAGES", 10);
+const MAX_RETRIES = positiveIntegerEnv("BACKFILL_GITHUB_MAX_RETRIES", 3);
+const BASE_BACKOFF_MS = positiveIntegerEnv(
+  "BACKFILL_GITHUB_BASE_BACKOFF_MS",
+  500,
+);
+const MAX_BACKOFF_MS = positiveIntegerEnv(
+  "BACKFILL_GITHUB_MAX_BACKOFF_MS",
+  30_000,
+);
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 const serviceSupabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
@@ -88,6 +134,10 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function bearerToken(req: Request): string | null {
@@ -144,6 +194,38 @@ async function githubFetchJson<T>(
   accessToken: string,
   accept = "application/vnd.github+json",
 ): Promise<{ data: T; nextUrl: string | null }> {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+    try {
+      return await githubFetchJsonOnce<T>(url, accessToken, accept);
+    } catch (error) {
+      if (!(error instanceof GitHubApiError) || !shouldRetry(error)) {
+        throw error;
+      }
+
+      if (attempt >= MAX_RETRIES) throw error;
+
+      const waitMs = retryDelayMs(error, attempt);
+      console.warn(JSON.stringify({
+        message: "backfill-user-activities retrying GitHub request",
+        url,
+        attempt: attempt + 1,
+        wait_ms: waitMs,
+        status: error.status,
+        retry_after: error.retryAfter ?? null,
+        rate_limit_reset: error.rateLimitReset ?? null,
+      }));
+      await delay(waitMs);
+    }
+  }
+
+  throw new GitHubApiError("GitHub request retry loop failed", 0);
+}
+
+async function githubFetchJsonOnce<T>(
+  url: string,
+  accessToken: string,
+  accept: string,
+): Promise<{ data: T; nextUrl: string | null }> {
   let response: Response;
 
   try {
@@ -193,6 +275,31 @@ async function githubFetchJson<T>(
   };
 }
 
+function shouldRetry(error: GitHubApiError): boolean {
+  if (error.status === 0) return true;
+  if (error.status === 429) return true;
+  if (error.status === 403 && error.message.includes("rate limit")) {
+    return true;
+  }
+  return error.status >= 500;
+}
+
+function retryDelayMs(error: GitHubApiError, attempt: number): number {
+  const retryAfterSeconds = Number(error.retryAfter);
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return Math.min(retryAfterSeconds * 1000, MAX_BACKOFF_MS);
+  }
+
+  if (error.rateLimitReset) {
+    const resetMs = new Date(error.rateLimitReset).getTime() - Date.now();
+    if (Number.isFinite(resetMs) && resetMs > 0) {
+      return Math.min(resetMs, MAX_BACKOFF_MS);
+    }
+  }
+
+  return Math.min(BASE_BACKOFF_MS * 2 ** attempt, MAX_BACKOFF_MS);
+}
+
 function nextLink(linkHeader: string | null): string | null {
   if (!linkHeader) return null;
 
@@ -206,92 +313,79 @@ function nextLink(linkHeader: string | null): string | null {
   return null;
 }
 
-async function fetchGitHubEvents(
+async function fetchGitHubEventsPage(
   accessToken: string,
-  username: string,
+  url: string,
   cutoff: Date,
   limit: number,
-): Promise<GitHubFetchResult> {
+): Promise<GitHubPageResult> {
   const activities: ActivityInput[] = [];
-  let fetched = 0;
   let normalized = 0;
-  let url: string | null = `https://api.github.com/users/${
-    encodeURIComponent(username)
-  }/events?per_page=100`;
+  let reachedCutoff = false;
 
-  for (
-    let page = 0;
-    url && page < MAX_GITHUB_PAGES && activities.length < limit;
-    page += 1
-  ) {
-    const pageResult: { data: GitHubEvent[]; nextUrl: string | null } =
-      await githubFetchJson<GitHubEvent[]>(
-        url,
-        accessToken,
-      );
-    const data = pageResult.data;
-    const fetchedNextUrl: string | null = pageResult.nextUrl;
-    fetched += data.length;
+  const pageResult = await githubFetchJson<GitHubEvent[]>(url, accessToken);
+  const data = pageResult.data;
 
-    for (const event of data) {
-      const createdAt = new Date(event.created_at);
-      if (createdAt < cutoff) continue;
-
-      const activity = normalizeGitHubEvent(event);
-      if (activity) {
-        normalized += 1;
-        activities.push(activity);
-      }
-      if (activities.length >= limit) break;
+  for (const event of data) {
+    const createdAt = new Date(event.created_at);
+    if (createdAt < cutoff) {
+      reachedCutoff = true;
+      continue;
     }
 
-    // GitHub Events are newest first, so older pages cannot enter the window.
-    if (data.some((event) => new Date(event.created_at) < cutoff)) break;
-    url = fetchedNextUrl;
+    const activity = normalizeGitHubEvent(event);
+    if (activity) {
+      normalized += 1;
+      activities.push(activity);
+    }
+    if (activities.length >= limit) break;
   }
 
-  return { fetched, normalized, activities };
+  return {
+    fetched: data.length,
+    normalized,
+    activities,
+    nextUrl: pageResult.nextUrl,
+    reachedCutoff,
+  };
 }
 
-async function fetchGitHubStars(
+async function fetchGitHubStarsPage(
   accessToken: string,
+  url: string,
   cutoff: Date,
   remainingLimit: number,
-): Promise<GitHubFetchResult> {
+): Promise<GitHubPageResult> {
   const activities: ActivityInput[] = [];
-  let fetched = 0;
   let normalized = 0;
-  let url: string | null = "https://api.github.com/user/starred?per_page=100";
+  let reachedCutoff = false;
 
-  for (
-    let page = 0;
-    url && page < MAX_GITHUB_PAGES && activities.length < remainingLimit;
-    page += 1
-  ) {
-    const pageResult: { data: GitHubStar[]; nextUrl: string | null } =
-      await githubFetchJson<GitHubStar[]>(
-        url,
-        accessToken,
-        "application/vnd.github.star+json",
-      );
-    const data = pageResult.data;
-    const fetchedNextUrl: string | null = pageResult.nextUrl;
-    fetched += data.length;
+  const pageResult = await githubFetchJson<GitHubStar[]>(
+    url,
+    accessToken,
+    "application/vnd.github.star+json",
+  );
+  const data = pageResult.data;
 
-    for (const star of data) {
-      const starredAt = new Date(star.starred_at);
-      if (starredAt < cutoff) continue;
-
-      normalized += 1;
-      activities.push(normalizeStar(star));
-      if (activities.length >= remainingLimit) break;
+  for (const star of data) {
+    const starredAt = new Date(star.starred_at);
+    if (starredAt < cutoff) {
+      reachedCutoff = true;
+      continue;
     }
 
-    if (data.some((star) => new Date(star.starred_at) < cutoff)) break;
-    url = fetchedNextUrl;
+    normalized += 1;
+    activities.push(normalizeStar(star));
+    if (activities.length >= remainingLimit) break;
   }
 
-  return { fetched, normalized, activities };
+  return {
+    fetched: data.length,
+    normalized,
+    activities,
+    nextUrl: pageResult.nextUrl,
+    reachedCutoff,
+  };
 }
 
 function normalizeGitHubEvent(event: GitHubEvent): ActivityInput | null {
@@ -405,31 +499,260 @@ function getString(object: Json | null, key: string): string | null {
   return typeof value === "string" ? value : null;
 }
 
-async function persistActivities(
+async function recordBackfillActivityChunk(
   userId: string,
   activities: ActivityInput[],
-  force: boolean,
 ): Promise<{
-  already_backfilled: boolean;
   inserted_count: number;
   duplicate_count: number;
   exp_applied: number;
-  backfilled_at: string | null;
 }> {
-  const { data, error } = await serviceSupabase.rpc("add_pet_exp", {
-    p_user_id: userId,
-    p_activities: activities,
-    p_force: force,
-  });
+  if (activities.length === 0) {
+    return { inserted_count: 0, duplicate_count: 0, exp_applied: 0 };
+  }
 
-  if (error) throw new Error(`RPC add_pet_exp bulk failed: ${error.message}`);
+  const { data, error } = await serviceSupabase.rpc(
+    "record_github_backfill_activities",
+    {
+      p_user_id: userId,
+      p_activities: activities,
+    },
+  );
+
+  if (error) {
+    throw new Error(
+      `RPC record_github_backfill_activities failed: ${error.message}`,
+    );
+  }
+
   return data as {
-    already_backfilled: boolean;
     inserted_count: number;
     duplicate_count: number;
     exp_applied: number;
-    backfilled_at: string | null;
   };
+}
+
+async function loadBackfillRun(userId: string): Promise<BackfillRun | null> {
+  const { data, error } = await serviceSupabase
+    .from("github_backfill_runs")
+    .select("*")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Load github_backfill_runs failed: ${error.message}`);
+  }
+
+  return data as BackfillRun | null;
+}
+
+async function saveBackfillRun(
+  userId: string,
+  patch: Partial<BackfillRun>,
+): Promise<void> {
+  const { error } = await serviceSupabase
+    .from("github_backfill_runs")
+    .upsert({
+      user_id: userId,
+      ...patch,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "user_id" });
+
+  if (error) {
+    throw new Error(`Save github_backfill_runs failed: ${error.message}`);
+  }
+}
+
+async function resetBackfillRun(userId: string): Promise<void> {
+  const { error } = await serviceSupabase
+    .from("github_backfill_runs")
+    .delete()
+    .eq("user_id", userId);
+
+  if (error) {
+    throw new Error(`Reset github_backfill_runs failed: ${error.message}`);
+  }
+}
+
+async function markBackfillCompleted(userId: string): Promise<string | null> {
+  const completedAt = new Date().toISOString();
+  const { data, error } = await serviceSupabase
+    .from("users")
+    .update({ backfilled_at: completedAt, updated_at: completedAt })
+    .eq("id", userId)
+    .select("backfilled_at")
+    .single();
+
+  if (error) {
+    throw new Error(`Mark backfill completed failed: ${error.message}`);
+  }
+
+  return (data as { backfilled_at: string | null }).backfilled_at;
+}
+
+function initialEventsUrl(username: string): string {
+  return `https://api.github.com/users/${
+    encodeURIComponent(username)
+  }/events?per_page=100`;
+}
+
+function initialStarsUrl(): string {
+  return "https://api.github.com/user/starred?per_page=100";
+}
+
+async function runResumableBackfill(
+  userId: string,
+  account: BackfillAccount,
+  cutoff: Date,
+  limit: number,
+  force: boolean,
+): Promise<BackfillSummary> {
+  if (force) {
+    await resetBackfillRun(userId);
+  }
+
+  const savedRun = force ? null : await loadBackfillRun(userId);
+  let phase: BackfillPhase = savedRun?.phase ?? "events";
+  let eventsNextUrl: string | null = savedRun?.events_next_url ??
+    initialEventsUrl(
+      account.username,
+    );
+  let starsNextUrl: string | null = savedRun?.stars_next_url ??
+    initialStarsUrl();
+  let fetchedEvents = savedRun?.fetched_events ?? 0;
+  let normalizedEvents = savedRun?.normalized_events ?? 0;
+  let savedCount = savedRun?.saved_count ?? 0;
+  let duplicateSkippedCount = savedRun?.duplicate_skipped_count ?? 0;
+  let expApplied = savedRun?.exp_applied ?? 0;
+
+  const saveRunningState = async (patch: Partial<BackfillRun> = {}) => {
+    await saveBackfillRun(userId, {
+      status: "running",
+      phase,
+      events_next_url: eventsNextUrl,
+      stars_next_url: starsNextUrl,
+      fetched_events: fetchedEvents,
+      normalized_events: normalizedEvents,
+      saved_count: savedCount,
+      duplicate_skipped_count: duplicateSkippedCount,
+      exp_applied: expApplied,
+      last_error: null,
+      retry_after: null,
+      rate_limit_reset: null,
+      completed_at: null,
+      ...patch,
+    });
+  };
+
+  try {
+    await saveRunningState();
+
+    // Public Events are returned newest-first. We follow every Link rel=next
+    // page until the requested date window or item limit is exhausted.
+    while (phase === "events" && eventsNextUrl && normalizedEvents < limit) {
+      await saveRunningState();
+      const page = await fetchGitHubEventsPage(
+        account.access_token!,
+        eventsNextUrl,
+        cutoff,
+        limit - normalizedEvents,
+      );
+      const persisted = await recordBackfillActivityChunk(
+        userId,
+        page.activities,
+      );
+
+      fetchedEvents += page.fetched;
+      normalizedEvents += page.normalized;
+      savedCount += persisted.inserted_count;
+      duplicateSkippedCount += persisted.duplicate_count;
+      expApplied += persisted.exp_applied;
+      eventsNextUrl = page.nextUrl;
+
+      if (page.reachedCutoff || !eventsNextUrl || normalizedEvents >= limit) {
+        phase = normalizedEvents >= limit ? "completed" : "stars";
+      }
+
+      await saveRunningState();
+    }
+
+    // Starred repositories use a separate endpoint, so the cursor is tracked
+    // independently from the Events API cursor.
+    while (phase === "stars" && starsNextUrl && normalizedEvents < limit) {
+      await saveRunningState();
+      const page = await fetchGitHubStarsPage(
+        account.access_token!,
+        starsNextUrl,
+        cutoff,
+        limit - normalizedEvents,
+      );
+      const persisted = await recordBackfillActivityChunk(
+        userId,
+        page.activities,
+      );
+
+      fetchedEvents += page.fetched;
+      normalizedEvents += page.normalized;
+      savedCount += persisted.inserted_count;
+      duplicateSkippedCount += persisted.duplicate_count;
+      expApplied += persisted.exp_applied;
+      starsNextUrl = page.nextUrl;
+
+      if (page.reachedCutoff || !starsNextUrl || normalizedEvents >= limit) {
+        phase = "completed";
+      }
+
+      await saveRunningState();
+    }
+
+    phase = "completed";
+    const backfilledAt = await markBackfillCompleted(userId);
+    await saveRunningState({
+      status: "completed",
+      phase,
+      completed_at: backfilledAt ?? new Date().toISOString(),
+    });
+
+    return {
+      fetched_events: fetchedEvents,
+      normalized_events: normalizedEvents,
+      saved_count: savedCount,
+      duplicate_skipped_count: duplicateSkippedCount,
+      exp_applied: expApplied,
+      completed: true,
+      backfilled_at: backfilledAt,
+      phase,
+    };
+  } catch (error) {
+    const retryAfter = error instanceof GitHubApiError
+      ? error.retryAfter ?? null
+      : null;
+    const rateLimitReset = error instanceof GitHubApiError
+      ? error.rateLimitReset ?? null
+      : null;
+    const status: BackfillStatus = error instanceof GitHubApiError &&
+        (error.status === 429 ||
+          (error.status === 403 && error.message.includes("rate limit")))
+      ? "rate_limited"
+      : "failed";
+
+    await saveBackfillRun(userId, {
+      status,
+      phase,
+      events_next_url: eventsNextUrl,
+      stars_next_url: starsNextUrl,
+      fetched_events: fetchedEvents,
+      normalized_events: normalizedEvents,
+      saved_count: savedCount,
+      duplicate_skipped_count: duplicateSkippedCount,
+      exp_applied: expApplied,
+      last_error: String(error),
+      retry_after: retryAfter,
+      rate_limit_reset: rateLimitReset,
+    });
+
+    throw error;
+  }
 }
 
 Deno.serve(async (req: Request) => {
@@ -442,6 +765,7 @@ Deno.serve(async (req: Request) => {
   }
 
   let body: RequestBody = {};
+  let activeUserId: string | null = null;
   try {
     body = await req.json();
   } catch {
@@ -450,6 +774,7 @@ Deno.serve(async (req: Request) => {
 
   try {
     const { userId, internal } = await resolveTargetUser(req, body);
+    activeUserId = userId;
     const force = internal && body.force === true;
     const days = body.days && body.days > 0
       ? Math.floor(body.days)
@@ -493,49 +818,40 @@ Deno.serve(async (req: Request) => {
       }, 409);
     }
 
-    const eventResult = await fetchGitHubEvents(
-      account.access_token,
-      account.username,
+    const persisted = await runResumableBackfill(
+      userId,
+      account,
       cutoff,
       limit,
+      force,
     );
-    const starResult = await fetchGitHubStars(
-      account.access_token,
-      cutoff,
-      Math.max(limit - eventResult.activities.length, 0),
-    );
-    const activities = [...eventResult.activities, ...starResult.activities]
-      .slice(0, limit);
-
-    const persisted = await persistActivities(userId, activities, force);
-    const fetchedEvents = eventResult.fetched + starResult.fetched;
-    const normalizedEvents = eventResult.normalized + starResult.normalized;
 
     console.log(JSON.stringify({
       message: "backfill-user-activities completed",
       user_id: userId,
       username: account.username,
-      fetched_events: fetchedEvents,
-      normalized_events: normalizedEvents,
-      saved_count: persisted.inserted_count,
-      duplicate_skipped_count: persisted.duplicate_count,
+      fetched_events: persisted.fetched_events,
+      normalized_events: persisted.normalized_events,
+      saved_count: persisted.saved_count,
+      duplicate_skipped_count: persisted.duplicate_skipped_count,
       exp_applied: persisted.exp_applied,
       backfilled_at: persisted.backfilled_at,
     }));
 
     return jsonResponse({
       user_id: userId,
-      fetched_events: fetchedEvents,
-      saved_count: persisted.inserted_count,
-      duplicate_skipped_count: persisted.duplicate_count,
+      fetched_events: persisted.fetched_events,
+      saved_count: persisted.saved_count,
+      duplicate_skipped_count: persisted.duplicate_skipped_count,
       exp_applied: persisted.exp_applied,
-      completed: true,
+      completed: persisted.completed,
       error: false,
       backfilled_at: persisted.backfilled_at,
-      skipped_reason: persisted.already_backfilled
-        ? "already_backfilled"
-        : undefined,
-      ignored_events: Math.max(fetchedEvents - normalizedEvents, 0),
+      phase: persisted.phase,
+      ignored_events: Math.max(
+        persisted.fetched_events - persisted.normalized_events,
+        0,
+      ),
     });
   } catch (error) {
     if (error instanceof GitPetError) {
@@ -552,8 +868,10 @@ Deno.serve(async (req: Request) => {
     }
 
     if (error instanceof GitHubApiError) {
+      const run = activeUserId ? await loadBackfillRun(activeUserId) : null;
       console.warn(JSON.stringify({
         message: "backfill-user-activities GitHub API error",
+        user_id: activeUserId,
         status: error.status,
         retry_after: error.retryAfter,
         rate_limit_reset: error.rateLimitReset,
@@ -561,14 +879,16 @@ Deno.serve(async (req: Request) => {
       }));
 
       return jsonResponse({
-        user_id: body.user_id ?? null,
-        fetched_events: 0,
-        saved_count: 0,
-        duplicate_skipped_count: 0,
-        exp_applied: 0,
+        user_id: activeUserId ?? body.user_id ?? null,
+        fetched_events: run?.fetched_events ?? 0,
+        saved_count: run?.saved_count ?? 0,
+        duplicate_skipped_count: run?.duplicate_skipped_count ?? 0,
+        exp_applied: run?.exp_applied ?? 0,
         completed: false,
         error: true,
         message: error.message,
+        phase: run?.phase ?? null,
+        resumable: Boolean(run?.events_next_url || run?.stars_next_url),
         github_status: error.status,
         retry_after: error.retryAfter ?? null,
         rate_limit_reset: error.rateLimitReset ?? null,
