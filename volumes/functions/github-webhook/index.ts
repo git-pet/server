@@ -1,14 +1,14 @@
-import { createClient } from "npm:@supabase/supabase-js@2";
-import { err, ok, type GitHubPayload } from "./types.ts";
-import { handlePush } from "./handlers/push.ts";
-import { handlePullRequest } from "./handlers/pull_request.ts";
+import { createClient } from "@supabase/supabase-js";
 import { handleIssues } from "./handlers/issues.ts";
+import { handlePullRequest } from "./handlers/pull_request.ts";
+import { handlePush } from "./handlers/push.ts";
 import { handleStar } from "./handlers/star.ts";
-import { logWebhookEvent } from "./lib/log-event.ts";
+import { err, type GitHubPayload, ok } from "./types.ts";
+import {
+  claimWebhookDelivery,
+  finishWebhookDelivery,
+} from "./lib/log-event.ts";
 
-// ──────────────────────────────────────────────
-// 서명 검증 (HMAC-SHA256)
-// ──────────────────────────────────────────────
 async function verifySignature(
   body: string,
   signature: string | null,
@@ -26,13 +26,11 @@ async function verifySignature(
   );
 
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(body));
-  const expected =
-    "sha256=" +
+  const expected = "sha256=" +
     Array.from(new Uint8Array(sig))
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
 
-  // タイミング攻撃 対策: 長さが違っても定数時間比較
   if (expected.length !== signature.length) return false;
 
   let mismatch = 0;
@@ -42,9 +40,6 @@ async function verifySignature(
   return mismatch === 0;
 }
 
-// ──────────────────────────────────────────────
-// Supabase 클라이언트 (service role — Edge Function 내부용)
-// ──────────────────────────────────────────────
 function makeSupabase() {
   const url = Deno.env.get("SUPABASE_URL");
   const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -52,9 +47,6 @@ function makeSupabase() {
   return createClient(url, key);
 }
 
-// ──────────────────────────────────────────────
-// 지원 이벤트 라우터
-// ──────────────────────────────────────────────
 const SUPPORTED_EVENTS = ["push", "pull_request", "issues", "star"] as const;
 type SupportedEvent = (typeof SUPPORTED_EVENTS)[number];
 
@@ -62,57 +54,89 @@ function isSupportedEvent(e: string | null): e is SupportedEvent {
   return SUPPORTED_EVENTS.includes(e as SupportedEvent);
 }
 
-// ──────────────────────────────────────────────
-// 메인 핸들러
-// ──────────────────────────────────────────────
 Deno.serve(async (req: Request) => {
-  // ── 1. Method guard
   if (req.method !== "POST") {
     return err("Method not allowed", 405);
   }
 
-  // ── 2. 바디 읽기 (서명 검증에 raw string 필요)
   const body = await req.text();
-
-  // ── 3. 서명 검증
   const signature = req.headers.get("x-hub-signature-256");
+  const eventType = req.headers.get("x-github-event");
+  const deliveryId = req.headers.get("x-github-delivery");
+
+  // Reject invalid signatures before parsing JSON or touching the database.
   if (!(await verifySignature(body, signature))) {
-    console.warn("[webhook] signature verification failed");
+    console.warn(
+      `[webhook] signature verification failed event=${eventType} delivery=${
+        deliveryId ?? "missing"
+      }`,
+    );
     return err("Unauthorized", 401);
   }
 
-  // ── 4. 헤더 파싱
-  const eventType = req.headers.get("x-github-event");
-  const deliveryId = req.headers.get("x-github-delivery") ?? "unknown";
+  if (!deliveryId) {
+    console.warn(`[webhook] missing X-GitHub-Delivery event=${eventType}`);
+    return err("Missing X-GitHub-Delivery", 400);
+  }
+
+  const supabase = makeSupabase();
+  const claim = await claimWebhookDelivery(supabase, {
+    eventType,
+    deliveryId,
+    rawBody: body,
+  });
+
+  // GitHub retries reuse the same delivery id. A duplicate delivery is already
+  // processed or currently processing, so acknowledge it before handlers run.
+  if (!claim.claimed) {
+    console.log(
+      `[webhook] duplicate delivery=${deliveryId} status=${claim.status}`,
+    );
+    return ok("duplicate delivery acknowledged", {
+      deliveryId,
+      duplicate: true,
+      status: claim.status,
+      processedAt: claim.processed_at ?? null,
+    });
+  }
 
   console.log(`[webhook] event=${eventType} delivery=${deliveryId}`);
 
-  // ── 5. 페이로드 파싱
   let payload: GitHubPayload;
   try {
     payload = JSON.parse(body);
   } catch {
+    await finishWebhookDelivery(supabase, {
+      deliveryId,
+      status: "failed",
+      errorMessage: "Invalid JSON payload",
+    });
     return err("Invalid JSON payload", 400);
   }
 
-  // ── 6. ping 이벤트 — 즉시 ack (설치 직후 GitHub이 보냄)
   if (eventType === "ping") {
-    console.log(`[webhook] ping received — zen: ${payload.zen ?? ""}`);
+    console.log(`[webhook] ping received zen=${payload.zen ?? ""}`);
+    await finishWebhookDelivery(supabase, {
+      deliveryId,
+      status: "ignored",
+      action: payload.action ?? null,
+    });
     return ok("pong");
   }
 
-  // ── 7. 미지원 이벤트 — 200 ack + 로그
   if (!isSupportedEvent(eventType)) {
     console.log(`[webhook] unsupported event '${eventType}', ack only`);
+    await finishWebhookDelivery(supabase, {
+      deliveryId,
+      status: "ignored",
+      action: payload.action ?? null,
+    });
     return ok(`event '${eventType}' acknowledged`);
   }
 
-  // ── 8. Supabase 클라이언트 생성
-  const supabase = makeSupabase();
   const ctx = { supabase, payload, deliveryId };
-
-  // ── 9. 이벤트 라우팅
   let response: Response;
+
   try {
     switch (eventType) {
       case "push":
@@ -131,13 +155,16 @@ Deno.serve(async (req: Request) => {
         return ok(`event '${eventType}' acknowledged`);
     }
   } catch (e) {
-    console.error(`[webhook] unhandled error (event=${eventType}):`, e);
+    console.error(`[webhook] unhandled error event=${eventType}:`, e);
+    await finishWebhookDelivery(supabase, {
+      deliveryId,
+      status: "failed",
+      action: payload.action ?? null,
+      errorMessage: String(e).slice(0, 1000),
+    });
     return err("Internal server error", 500);
   }
 
-  // ── 10. 수신 이벤트 로깅 (실패해도 응답에 영향 없음)
-  //   핸들러 응답 body에서 지급 결과(userId/xp)를 꺼내 기록한다.
-  //   body는 한 번만 읽히므로 clone해서 파싱.
   let userId: string | null = null;
   let xpAwarded = 0;
   try {
@@ -145,16 +172,16 @@ Deno.serve(async (req: Request) => {
     userId = parsed.userId ?? null;
     xpAwarded = typeof parsed.xp === "number" ? parsed.xp : 0;
   } catch {
-    // 핸들러가 결과 필드 없는 응답을 준 경우 → 0/null로 기록
+    // Some handlers may return a simple acknowledgement without XP details.
   }
 
-  await logWebhookEvent(supabase, {
-    eventType,
+  await finishWebhookDelivery(supabase, {
+    deliveryId,
+    status: response.ok ? "processed" : "failed",
     action: payload.action ?? null,
     userId,
     xpAwarded,
-    deliveryId,
-    rawBody: body,
+    errorMessage: response.ok ? null : `handler returned ${response.status}`,
   });
 
   return response;

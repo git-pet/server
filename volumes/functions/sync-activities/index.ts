@@ -1,6 +1,14 @@
 import { createClient } from "@supabase/supabase-js";
-
-type Json = Record<string, unknown>;
+import {
+  GitHubApiError,
+  type GitHubEvent,
+  githubFetchJson,
+  type GitHubStar,
+  type Json,
+  type NormalizedGitHubActivity,
+  normalizeGitHubEvent,
+  normalizeStar,
+} from "../_shared/github_activity.ts";
 
 type SyncAccount = {
   user_id: string;
@@ -8,24 +16,6 @@ type SyncAccount = {
   username: string;
   access_token: string;
   last_synced_at: string | null;
-};
-
-type GitHubEvent = {
-  id: string;
-  type: string;
-  created_at: string;
-  repo?: { id?: number; name?: string };
-  payload?: Json;
-};
-
-type GitHubStar = {
-  starred_at: string;
-  repo: {
-    id: number;
-    full_name: string;
-    html_url?: string;
-    owner?: { id?: number; login?: string };
-  };
 };
 
 type ActivityEventType = "commit" | "pull_request" | "issue" | "star";
@@ -66,17 +56,6 @@ type RequestInput = {
   max_users?: number;
 };
 
-class GitHubApiError extends Error {
-  constructor(
-    message: string,
-    public status: number,
-    public retryAfter?: string | null,
-    public rateLimitReset?: string | null,
-  ) {
-    super(message);
-  }
-}
-
 const SUPABASE_URL = mustGetEnv("SUPABASE_URL");
 const SERVICE_ROLE_KEY = mustGetEnv("SUPABASE_SERVICE_ROLE_KEY");
 const SYNC_SECRET = Deno.env.get("SYNC_ACTIVITIES_SECRET");
@@ -92,6 +71,15 @@ const DEFAULT_MAX_USERS = positiveIntegerEnv("SYNC_ACTIVITIES_MAX_USERS", 50);
 const SYNC_OVERLAP_MINUTES = positiveIntegerEnv(
   "SYNC_ACTIVITIES_OVERLAP_MINUTES",
   5,
+);
+const MAX_RETRIES = positiveIntegerEnv("SYNC_ACTIVITIES_MAX_RETRIES", 3);
+const BASE_BACKOFF_MS = positiveIntegerEnv(
+  "SYNC_ACTIVITIES_BASE_BACKOFF_MS",
+  500,
+);
+const MAX_BACKOFF_MS = positiveIntegerEnv(
+  "SYNC_ACTIVITIES_MAX_BACKOFF_MS",
+  30_000,
 );
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_MINUTE_MS = 60 * 1000;
@@ -142,73 +130,6 @@ async function loadAccounts(userId?: string): Promise<SyncAccount[]> {
   return (data ?? []) as SyncAccount[];
 }
 
-async function githubFetchJson<T>(
-  url: string,
-  accessToken: string,
-  accept = "application/vnd.github+json",
-): Promise<{ data: T; nextUrl: string | null }> {
-  let response: Response;
-
-  try {
-    response = await fetch(url, {
-      headers: {
-        accept,
-        authorization: `Bearer ${accessToken}`,
-        "x-github-api-version": "2022-11-28",
-        "user-agent": "git-pet-sync-activities",
-      },
-    });
-  } catch (error) {
-    throw new GitHubApiError(`GitHub network error: ${String(error)}`, 0);
-  }
-
-  if (!response.ok) {
-    const body = await response.text();
-    const remaining = response.headers.get("x-ratelimit-remaining");
-    const reset = response.headers.get("x-ratelimit-reset");
-    const retryAfter = response.headers.get("retry-after");
-    const resetAt = reset ? new Date(Number(reset) * 1000).toISOString() : null;
-
-    if (response.status === 401) {
-      throw new GitHubApiError("GitHub token is expired or invalid", 401);
-    }
-
-    if (response.status === 403 && remaining === "0") {
-      throw new GitHubApiError(
-        "GitHub rate limit exceeded",
-        403,
-        retryAfter,
-        resetAt,
-      );
-    }
-
-    throw new GitHubApiError(
-      `GitHub ${response.status}: ${body.slice(0, 500)}`,
-      response.status,
-      retryAfter,
-      resetAt,
-    );
-  }
-
-  return {
-    data: await response.json() as T,
-    nextUrl: nextLink(response.headers.get("link")),
-  };
-}
-
-function nextLink(linkHeader: string | null): string | null {
-  if (!linkHeader) return null;
-
-  for (const part of linkHeader.split(",")) {
-    const [rawUrl, rawRel] = part.trim().split(";");
-    if (rawRel?.trim() === 'rel="next"') {
-      return rawUrl.trim().slice(1, -1);
-    }
-  }
-
-  return null;
-}
-
 async function fetchGitHubEvents(
   account: SyncAccount,
   cutoff: Date,
@@ -222,7 +143,12 @@ async function fetchGitHubEvents(
 
   for (let page = 0; url && page < MAX_GITHUB_PAGES; page += 1) {
     const pageResult: { data: GitHubEvent[]; nextUrl: string | null } =
-      await githubFetchJson<GitHubEvent[]>(url, account.access_token);
+      await githubFetchJson<GitHubEvent[]>(
+        url,
+        account.access_token,
+        "application/vnd.github+json",
+        githubRetryOptions(),
+      );
     const data = pageResult.data;
     const fetchedNextUrl: string | null = pageResult.nextUrl;
     fetched += data.length;
@@ -231,10 +157,10 @@ async function fetchGitHubEvents(
       const createdAt = new Date(event.created_at);
       if (createdAt < cutoff) continue;
 
-      const activity = normalizeGitHubEvent(event);
+      const activity = normalizeGitHubEvent(event, "sync-activities");
       if (activity) {
         normalized += 1;
-        activities.push(activity);
+        activities.push(fromSharedActivity(activity));
       }
     }
 
@@ -262,6 +188,7 @@ async function fetchGitHubStars(
         url,
         accessToken,
         "application/vnd.github.star+json",
+        githubRetryOptions(),
       );
     const data = pageResult.data;
     const fetchedNextUrl: string | null = pageResult.nextUrl;
@@ -272,7 +199,9 @@ async function fetchGitHubStars(
       if (starredAt < cutoff) continue;
 
       normalized += 1;
-      activities.push(normalizeStar(star));
+      activities.push(
+        fromSharedActivity(normalizeStar(star, "sync-activities")),
+      );
     }
 
     if (data.some((star) => new Date(star.starred_at) < cutoff)) break;
@@ -282,115 +211,25 @@ async function fetchGitHubStars(
   return { fetched, normalized, activities };
 }
 
-function normalizeGitHubEvent(event: GitHubEvent): NormalizedActivity | null {
-  const payload = event.payload ?? {};
-  const repo = event.repo?.name ?? null;
-
-  if (event.type === "PushEvent") {
-    const commits = Array.isArray(payload.commits) ? payload.commits : [];
-    if (commits.length === 0) return null;
-
-    return {
-      eventType: "commit",
-      xp: Math.min(commits.length * 10, 50),
-      dedupeKey: `github-rest:event:${event.id}`,
-      createdAt: event.created_at,
-      metadata: {
-        source: "sync-activities",
-        github_event_type: event.type,
-        repo,
-        commits: commits.length,
-        github_event: event,
-      },
-    };
-  }
-
-  if (event.type === "PullRequestEvent") {
-    const action = getString(payload, "action");
-    const pr = asJsonObject(payload.pull_request);
-    const merged = pr?.merged === true;
-    let xp = 0;
-
-    if (action === "opened") xp = 20;
-    else if (action === "closed" && merged) xp = 50;
-    else if (action === "closed") xp = 5;
-    else return null;
-
-    return {
-      eventType: "pull_request",
-      xp,
-      dedupeKey: `github-rest:event:${event.id}`,
-      createdAt: event.created_at,
-      metadata: {
-        source: "sync-activities",
-        github_event_type: event.type,
-        repo,
-        action,
-        number: pr?.number ?? null,
-        title: getString(pr, "title"),
-        url: getString(pr, "html_url"),
-        github_event: event,
-      },
-    };
-  }
-
-  if (event.type === "IssuesEvent") {
-    const action = getString(payload, "action");
-    const issue = asJsonObject(payload.issue);
-    let xp = 0;
-
-    if (action === "opened") xp = 10;
-    else if (action === "closed") xp = 20;
-    else return null;
-
-    return {
-      eventType: "issue",
-      xp,
-      dedupeKey: `github-rest:event:${event.id}`,
-      createdAt: event.created_at,
-      metadata: {
-        source: "sync-activities",
-        github_event_type: event.type,
-        repo,
-        action,
-        number: issue?.number ?? null,
-        title: getString(issue, "title"),
-        url: getString(issue, "html_url"),
-        github_event: event,
-      },
-    };
-  }
-
-  return null;
-}
-
-function normalizeStar(star: GitHubStar): NormalizedActivity {
+function githubRetryOptions() {
   return {
-    eventType: "star",
-    xp: 5,
-    dedupeKey: `github-rest:star:${star.repo.id}:${star.starred_at}`,
-    createdAt: star.starred_at,
-    metadata: {
-      source: "sync-activities",
-      github_event_type: "StarredRepository",
-      repo: star.repo.full_name,
-      repo_id: star.repo.id,
-      url: star.repo.html_url ?? null,
-      owner: star.repo.owner?.login ?? null,
-      starred_at: star.starred_at,
-    },
+    maxRetries: MAX_RETRIES,
+    baseBackoffMs: BASE_BACKOFF_MS,
+    maxBackoffMs: MAX_BACKOFF_MS,
+    userAgent: "git-pet-sync-activities",
   };
 }
 
-function asJsonObject(value: unknown): Json | null {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as Json
-    : null;
-}
-
-function getString(object: Json | null, key: string): string | null {
-  const value = object?.[key];
-  return typeof value === "string" ? value : null;
+function fromSharedActivity(
+  activity: NormalizedGitHubActivity,
+): NormalizedActivity {
+  return {
+    eventType: activity.event_type,
+    xp: activity.xp_gained,
+    dedupeKey: activity.github_event_id,
+    createdAt: activity.created_at,
+    metadata: activity.metadata,
+  };
 }
 
 async function awardActivity(

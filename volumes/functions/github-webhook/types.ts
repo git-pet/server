@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "@supabase/supabase-js";
 // 핸들러 공통 컨텍스트
 export interface HandlerContext {
   supabase: SupabaseClient;
@@ -23,8 +23,7 @@ export interface GitHubPayload {
   ref?: string;
   pull_request?: GitHubPullRequest;
   issue?: GitHubIssue;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  [key: string]: any;
+  [key: string]: unknown;
 }
 export interface GitHubCommit {
   id: string;

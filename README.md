@@ -64,6 +64,20 @@ curl "$SUPABASE_URL/functions/v1/pet-checkin/streak" \
   -H "Authorization: Bearer $USER_JWT"
 ```
 
+### Leaderboard
+
+`leaderboard` returns public EXP rankings with nickname/avatar fields. Top lists
+are cached in the Edge Function process for five minutes.
+
+```bash
+curl "$SUPABASE_URL/functions/v1/leaderboard?type=exp&limit=100"
+
+curl "$SUPABASE_URL/functions/v1/leaderboard?type=weekly&limit=100"
+
+curl "$SUPABASE_URL/functions/v1/leaderboard/me?type=exp" \
+  -H "Authorization: Bearer $USER_JWT"
+```
+
 ### Backfill user activities
 
 `backfill-user-activities` initializes a newly signed-up GitHub OAuth user with
@@ -94,6 +108,11 @@ activity from GitHub REST API, stores normalized rows in `public.activities`,
 and relies on `add_pet_exp` plus the existing activity trigger to update the
 pet. `public.users.backfilled_at` and `activities.github_event_id` make repeated
 calls idempotent.
+
+Large backfills follow GitHub `Link` pagination until the requested date or
+item limit is reached. Each fetched page is bulk inserted and the current cursor
+is stored in `public.github_backfill_runs`, so rate limits or network failures
+can be retried without re-awarding already saved EXP.
 
 ### Sync activities
 
@@ -167,4 +186,3 @@ See the [security section](https://supabase.com/docs/guides/self-hosting/docker#
 ## License
 
 This repository is licensed under the Apache 2.0 License. See the main [Supabase repository](https://github.com/supabase/supabase) for details.
-
